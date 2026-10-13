@@ -29,9 +29,19 @@ def list_alarms(
     if severity:
         q = q.where(Alarm.severity == severity)
     alarms = session.exec(q.limit(limit)).all()
+    # Load all acknowledgements in one query instead of one query per alarm.
+    # This avoids an N+1 query pattern when the alarm queue is large.
+    alarm_ids = [a.id for a in alarms if a.id is not None]
+    acks_by_alarm: dict[int, list[AlarmAck]] = {}
+    if alarm_ids:
+        for ack in session.exec(
+            select(AlarmAck).where(AlarmAck.alarm_id.in_(alarm_ids))
+        ).all():
+            acks_by_alarm.setdefault(ack.alarm_id, []).append(ack)
+
     # ISA-18.2 priority ordering: severity rank then recency
     alarms.sort(key=lambda a: (a.severity.rank, -a.ts.timestamp()))
-    return [_alarm_dict(session, a) for a in alarms]
+    return [_alarm_dict_from_acks(a, acks_by_alarm.get(a.id, [])) for a in alarms]
 
 
 @router.get("/rate")
@@ -84,6 +94,10 @@ def clear_alarm(alarm_id: int, request: Request, session: Session = Depends(get_
 
 def _alarm_dict(session: Session, a: Alarm, full: bool = False) -> dict:
     acks = session.exec(select(AlarmAck).where(AlarmAck.alarm_id == a.id)).all()
+    return _alarm_dict_from_acks(a, acks, full=full)
+
+
+def _alarm_dict_from_acks(a: Alarm, acks: list[AlarmAck], full: bool = False) -> dict:
     d = {
         "id": a.id, "tank_id": a.tank_id, "ts": a.ts.isoformat(),
         "parameter": a.parameter, "value": a.value, "limit": a.limit,

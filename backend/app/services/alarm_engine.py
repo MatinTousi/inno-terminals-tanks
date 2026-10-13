@@ -43,24 +43,53 @@ def evaluate_reading(session: Session, tank: Tank, reading) -> list[Alarm]:
     raised: list[Alarm] = []
     worst = AlarmStatusTracker()
 
+    # Load all configured thresholds once for this tank instead of issuing one
+    # query per monitored parameter.
+    threshold_rows = session.exec(
+        select(Threshold).where(Threshold.tank_id == tank.id)
+    ).all()
+    thresholds = {row.parameter: row for row in threshold_rows}
+
+    # Load the tank's active/suppressed threshold alarms once. The previous
+    # implementation queried Alarm separately for every monitored parameter.
+    active_states = [
+        AlarmState.ACTIVE, AlarmState.ACKNOWLEDGED, AlarmState.SUPPRESSED
+    ]
+    existing_rows = session.exec(
+        select(Alarm).where(
+            Alarm.tank_id == tank.id,
+            Alarm.kind == "threshold",
+            Alarm.state.in_(active_states),
+        )
+    ).all()
+    existing_by_dedup = {alarm.dedup_key: alarm for alarm in existing_rows}
+
     for param in _MONITORED:
         value = getattr(reading, param, None)
         if value is None:
             continue
-        lim = _effective_limits(session, tank.id, param)
+        row = thresholds.get(param)
+        lim = dict(DEFAULT_LIMITS.get(param, {}))
+        if row:
+            for key in ("lo_warn", "lo_critical", "hi_warn", "hi_critical"):
+                value_override = getattr(row, key)
+                if value_override is not None:
+                    lim[key] = value_override
         severity, limit, direction = _classify(value, lim)
         worst.update(severity)
         if severity is None:
-            _auto_clear(session, tank.id, param)
+            for stale in existing_rows:
+                if (
+                    stale.parameter == param
+                    and stale.state in (AlarmState.ACTIVE, AlarmState.ACKNOWLEDGED)
+                ):
+                    stale.state = AlarmState.CLEARED
+                    stale.cleared_at = utcnow()
+                    session.add(stale)
             continue
 
         dedup = f"threshold:{tank.id}:{param}:{direction}"
-        existing = session.exec(
-            select(Alarm).where(
-                Alarm.dedup_key == dedup,
-                Alarm.state.in_([AlarmState.ACTIVE, AlarmState.ACKNOWLEDGED, AlarmState.SUPPRESSED]),
-            )
-        ).first()
+        existing = existing_by_dedup.get(dedup)
         if existing:
             existing.value = value  # refresh, don't duplicate (FR-4.5)
             session.add(existing)
@@ -81,6 +110,7 @@ def evaluate_reading(session: Session, tank: Tank, reading) -> list[Alarm]:
         )
         _apply_isa_18_2(session, alarm)
         session.add(alarm)
+        existing_by_dedup[dedup] = alarm
         raised.append(alarm)
 
     # update tank colour code (FR-1.3)

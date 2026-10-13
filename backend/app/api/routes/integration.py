@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
-from sqlmodel import Session, select
+from sqlmodel import Session, func, select
 
 from app.api.deps import get_current_user, require_roles
 from app.database import get_session
@@ -25,10 +25,10 @@ router = APIRouter()
 def opcua_nodes(session: Session = Depends(get_session), _: User = Depends(get_current_user)):
     """OPC-UA address space projection (FR-6.1 / SW-2)."""
     nodes = []
-    for t in session.exec(select(Tank)).all():
-        r = session.exec(
-            select(Reading).where(Reading.tank_id == t.id).order_by(Reading.ts.desc())
-        ).first()
+    tanks = session.exec(select(Tank)).all()
+    latest_by_tank = _latest_readings_by_tank(session)
+    for t in tanks:
+        r = latest_by_tank.get(t.id)
         for param in ("level", "temperature", "pressure", "flammable_gas_ppm"):
             nodes.append({
                 "nodeId": f"ns=2;s=Terminal.{t.code}.{param}",
@@ -38,6 +38,22 @@ def opcua_nodes(session: Session = Depends(get_session), _: User = Depends(get_c
                 "sourceTimestamp": r.ts.isoformat() if r else None,
             })
     return {"serverStatus": "running", "nodeCount": len(nodes), "nodes": nodes}
+
+
+def _latest_readings_by_tank(session: Session) -> dict[int, Reading]:
+    """Fetch one latest reading per tank with a grouped DB query."""
+    latest = (
+        select(Reading.tank_id, func.max(Reading.ts).label("max_ts"))
+        .group_by(Reading.tank_id)
+        .subquery()
+    )
+    rows = session.exec(
+        select(Reading).join(
+            latest,
+            (Reading.tank_id == latest.c.tank_id) & (Reading.ts == latest.c.max_ts),
+        )
+    ).all()
+    return {r.tank_id: r for r in rows}
 
 
 class ERPOrder(BaseModel):
@@ -71,10 +87,10 @@ def erp_order(order: ERPOrder, session: Session = Depends(get_session),
 def cmms_work_orders(session: Session = Depends(get_session), _: User = Depends(get_current_user)):
     """FR-6.2 — preventive work orders derived from equipment health (RCM / ISO 14224)."""
     orders = []
-    for t in session.exec(select(Tank)).all():
-        r = session.exec(
-            select(Reading).where(Reading.tank_id == t.id).order_by(Reading.ts.desc())
-        ).first()
+    tanks = session.exec(select(Tank)).all()
+    latest_by_tank = _latest_readings_by_tank(session)
+    for t in tanks:
+        r = latest_by_tank.get(t.id)
         if not r:
             continue
         if r.vibration_mm_s > 5.0:

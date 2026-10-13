@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlmodel import Session, select
+from sqlmodel import Session, func, select
 
 from app.config import settings
 from app.models.reading import Reading
@@ -30,12 +30,13 @@ def ingest_batch(session: Session, readings: list[dict], *, score: bool = True) 
     if len(readings) > settings.max_ingest_batch:
         readings = readings[: settings.max_ingest_batch]
 
-    tanks = {t.code: t for t in session.exec(select(Tank)).all()}
+    tanks_by_code = {t.code: t for t in session.exec(select(Tank)).all()}
+    tanks_by_id = {t.id: t for t in tanks_by_code.values() if t.id is not None}
     stored: list[Reading] = []
     touched: set[int] = set()
 
     for item in readings:
-        tank = tanks.get(item.get("tank_code")) or _by_id(tanks, item.get("tank_id"))
+        tank = tanks_by_code.get(item.get("tank_code")) or tanks_by_id.get(item.get("tank_id"))
         if not tank:
             continue
         ts = item.get("ts")
@@ -105,15 +106,6 @@ def _active_alarm_ids(session: Session, tank_id: int) -> set[int]:
     return set(rows)
 
 
-def _by_id(tanks: dict[str, Tank], tank_id) -> Tank | None:
-    if tank_id is None:
-        return None
-    for t in tanks.values():
-        if t.id == tank_id:
-            return t
-    return None
-
-
 def _reading_payload(tank: Tank, r: Reading) -> dict:
     return {
         "tank_id": tank.id, "tank_code": tank.code, "status": tank.status.value,
@@ -129,11 +121,17 @@ def mark_stale_tanks(session: Session, *, seconds: int = 120) -> int:
     """Set tanks OFFLINE when no reading has arrived recently (FR-1 / NFR-2.2)."""
     cutoff = datetime.now(timezone.utc).timestamp() - seconds
     n = 0
-    for tank in session.exec(select(Tank)).all():
-        latest = session.exec(
-            select(Reading).where(Reading.tank_id == tank.id).order_by(Reading.ts.desc())
-        ).first()
-        stale = (not latest) or latest.ts.replace(tzinfo=timezone.utc).timestamp() < cutoff
+    tanks = session.exec(select(Tank)).all()
+    latest_ts = session.exec(
+        select(Reading.tank_id, func.max(Reading.ts))
+        .group_by(Reading.tank_id)
+    ).all()
+    latest_by_tank = {tank_id: ts for tank_id, ts in latest_ts}
+
+    for tank in tanks:
+        latest = latest_by_tank.get(tank.id)
+        stale = (latest is None or
+                 latest.replace(tzinfo=timezone.utc).timestamp() < cutoff)
         if stale and tank.status != TankStatus.OFFLINE:
             tank.status = TankStatus.OFFLINE
             session.add(tank)

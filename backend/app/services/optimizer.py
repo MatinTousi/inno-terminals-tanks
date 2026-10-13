@@ -11,7 +11,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from sqlmodel import Session, select
+from sqlmodel import Session, func, select
 
 from app import secure
 from app.models.operation import Operation, OperationState
@@ -35,13 +35,22 @@ def _energy_kwh(volume_m3: float, flow: float, head_m: float = 25.0) -> float:
     return (rho * g * q * head_m / eta / 1000.0) * _duration_h(volume_m3, flow)
 
 
-def _latest_level(session: Session, tank: Tank) -> float:
+def _latest_levels(session: Session) -> dict[int, float]:
+    """Fetch the latest level for every tank with one grouped query."""
     from app.models.reading import Reading
 
-    r = session.exec(
-        select(Reading).where(Reading.tank_id == tank.id).order_by(Reading.ts.desc())
-    ).first()
-    return r.level if r else 50.0
+    latest = (
+        select(Reading.tank_id, func.max(Reading.ts).label("max_ts"))
+        .group_by(Reading.tank_id)
+        .subquery()
+    )
+    rows = session.exec(
+        select(Reading.tank_id, Reading.level).join(
+            latest,
+            (Reading.tank_id == latest.c.tank_id) & (Reading.ts == latest.c.max_ts),
+        )
+    ).all()
+    return {tank_id: level for tank_id, level in rows}
 
 
 def build_plan(session: Session, *, pump_count: int = 3, horizon_hours: int = 24) -> dict:
@@ -62,10 +71,11 @@ def build_plan(session: Session, *, pump_count: int = 3, horizon_hours: int = 24
             "priority": o.priority, "earliest_start": _aware(o.earliest_start),
             "due_by": _aware(o.due_by),
         })
+    latest_levels = _latest_levels(session)
     tank_dicts = {
         t.id: {
             "capacity_m3": t.capacity_m3, "max_safe_level_pct": t.max_safe_level_pct,
-            "level_pct": _latest_level(session, t),
+            "level_pct": latest_levels.get(t.id, 50.0),
         }
         for t in tanks.values()
     }
@@ -161,9 +171,16 @@ def what_if(session: Session, *, disabled_pumps: list[str] | None = None,
             "flow_rate_m3ph": e.get("flow_rate_m3ph", 300), "priority": e.get("priority", 3),
             "earliest_start": None, "due_by": None,
         })
-    tank_dicts = {t.id: {"capacity_m3": t.capacity_m3, "max_safe_level_pct": t.max_safe_level_pct,
-                         "level_pct": _latest_level(session, t)}
-                  for t in session.exec(select(Tank)).all()}
+    tanks = session.exec(select(Tank)).all()
+    latest_levels = _latest_levels(session)
+    tank_dicts = {
+        t.id: {
+            "capacity_m3": t.capacity_m3,
+            "max_safe_level_pct": t.max_safe_level_pct,
+            "level_pct": latest_levels.get(t.id, 50.0),
+        }
+        for t in tanks
+    }
     return _baseline_plan(op_dicts, tank_dicts, start, "whatif", effective) | {
         "disabled_pumps": sorted(disabled), "effective_pumps": effective,
     }

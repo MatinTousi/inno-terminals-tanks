@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
-from sqlmodel import Session, select
+from sqlmodel import Session, func, select
 
 from app.api.deps import client_ip, get_current_user, require_roles
 from app.core import audit
@@ -37,15 +37,12 @@ class TankOut(BaseModel):
 @router.get("", response_model=list[TankOut])
 def list_tanks(session: Session = Depends(get_session), _: User = Depends(get_current_user)):
     tanks = session.exec(select(Tank).order_by(Tank.code)).all()
+    latest_by_tank = _latest_readings_by_tank(session)
+    latest_pred_by_tank = _latest_predictions_by_tank(session)
     out = []
     for t in tanks:
-        latest = session.exec(
-            select(Reading).where(Reading.tank_id == t.id).order_by(Reading.ts.desc())
-        ).first()
-        pred = session.exec(
-            select(LeakPrediction).where(LeakPrediction.tank_id == t.id)
-            .order_by(LeakPrediction.ts.desc())
-        ).first()
+        latest = latest_by_tank.get(t.id)
+        pred = latest_pred_by_tank.get(t.id)
         out.append(TankOut(
             id=t.id, code=t.code, name=t.name, product=t.product,
             capacity_m3=t.capacity_m3, max_safe_level_pct=t.max_safe_level_pct,
@@ -55,6 +52,37 @@ def list_tanks(session: Session = Depends(get_session), _: User = Depends(get_cu
             leak_probability=pred.probability if pred else None,
         ))
     return out
+
+
+def _latest_readings_by_tank(session: Session) -> dict[int, Reading]:
+    latest = (
+        select(Reading.tank_id, func.max(Reading.ts).label("max_ts"))
+        .group_by(Reading.tank_id)
+        .subquery()
+    )
+    rows = session.exec(
+        select(Reading).join(
+            latest,
+            (Reading.tank_id == latest.c.tank_id) & (Reading.ts == latest.c.max_ts),
+        )
+    ).all()
+    return {r.tank_id: r for r in rows}
+
+
+def _latest_predictions_by_tank(session: Session) -> dict[int, LeakPrediction]:
+    latest = (
+        select(LeakPrediction.tank_id, func.max(LeakPrediction.ts).label("max_ts"))
+        .group_by(LeakPrediction.tank_id)
+        .subquery()
+    )
+    rows = session.exec(
+        select(LeakPrediction).join(
+            latest,
+            (LeakPrediction.tank_id == latest.c.tank_id)
+            & (LeakPrediction.ts == latest.c.max_ts),
+        )
+    ).all()
+    return {p.tank_id: p for p in rows}
 
 
 def _latest_dict(r: Reading | None) -> dict | None:

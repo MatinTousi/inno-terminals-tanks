@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlmodel import Session, select
+from sqlmodel import Session, func, select
 
 from app.api.deps import get_current_user
 from app.database import get_session
@@ -17,11 +17,22 @@ router = APIRouter()
 @router.get("")
 def latest_predictions(session: Session = Depends(get_session), _: User = Depends(get_current_user)):
     out = []
-    for tank in session.exec(select(Tank)).all():
-        p = session.exec(
-            select(LeakPrediction).where(LeakPrediction.tank_id == tank.id)
-            .order_by(LeakPrediction.ts.desc())
-        ).first()
+    tanks = session.exec(select(Tank)).all()
+    latest = (
+        select(LeakPrediction.tank_id, func.max(LeakPrediction.ts).label("max_ts"))
+        .group_by(LeakPrediction.tank_id)
+        .subquery()
+    )
+    predictions = session.exec(
+        select(LeakPrediction).join(
+            latest,
+            (LeakPrediction.tank_id == latest.c.tank_id)
+            & (LeakPrediction.ts == latest.c.max_ts),
+        )
+    ).all()
+    predictions_by_tank = {p.tank_id: p for p in predictions}
+    for tank in tanks:
+        p = predictions_by_tank.get(tank.id)
         if p:
             out.append(_pred_dict(tank, p))
     out.sort(key=lambda d: -d["probability"])
